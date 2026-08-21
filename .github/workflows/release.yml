@@ -1,0 +1,340 @@
+name: release
+
+# Cut a release from a `v*` tag: build the extension on all three platforms, publish the binaries as
+# Release assets, build the Asset Library zip, and commit a sha256 MANIFEST of what was published.
+#
+# NO BINARY IS COMMITTED, HERE OR ANYWHERE. What lands on main is `addons/orbitnav_native/binaries.json`
+# -- the size and sha256 of every published asset, plus the version this tag stamped into plugin.cfg. A
+# consumer pins the tag, downloads the assets and verifies them against a digest that lives in the commit
+# graph, which a checksum file published beside the asset cannot do: that verifies transport, not tamper.
+#
+# The manifest is written AFTER the assets are built, so a tag commit cannot contain its own digest; main
+# gets it one commit later. Harmless, because CI builds rather than fetches.
+#
+# THREE PROFILES. `template_debug` and `template_release` are what the .gdextension names and what the
+# zip carries. `profiling` is a symbolized developer build, published as an asset only -- shipping it
+# would put debug information nobody loads into every export. See tools/build-native.sh.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. v0.2.0). Manual runs do not publish.'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true   # a partial set of binaries must never be published
+      matrix:
+        include:
+          # Tag pushes and workflow_dispatch both require write access to this repository, unlike
+          # check.yml's pull_request gate -- see that file's header for why THAT one must stay
+          # GitHub-hosted. There is no fork-PR path into this workflow, so the self-hosted fleet is safe
+          # here.
+          - platform: linux
+            runner: [self-hosted, Linux, X64, legion]
+          - platform: windows
+            runner: [self-hosted, Windows, X64, legion-win]
+          - platform: macos
+            runner: [self-hosted, macOS, ARM64, legion-mac]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # NO dtolnay/rust-toolchain AND NO Swatinem/rust-cache ON THE SELF-HOSTED LEGS. Both exist to
+      # provision a fresh hosted runner. These boxes already carry rustup and a persistent `target/`
+      # directory, and both actions run `rustc` directly to build a cache key -- which is how a box whose
+      # rustup SHIMS had gone missing failed here with "rustc: command not found" while `rustup toolchain
+      # install` and `rustup default` both reported success. check.yml keeps the actions: it runs on
+      # GitHub-hosted runners that genuinely start empty.
+      #
+      # `cargo` is what the build invokes, and the rustup cargo shim points rustc at the toolchain itself,
+      # so cargo resolving is the condition that matters. native/rust-toolchain.toml pins the version;
+      # rustup honours it from inside that directory with no help from CI.
+      - name: Check the Rust toolchain on this runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in \
+            "$(command -v rustup >/dev/null 2>&1 && dirname "$(command -v rustup)" || true)" \
+            "${CARGO_HOME:-}/bin" \
+            "${USERPROFILE:-}/.cargo/bin" \
+            "$HOME/.cargo/bin"
+          do
+            [ -n "$dir" ] && [ -d "$dir" ] || continue
+            echo "-- $dir"
+            ls -l "$dir" || true
+            case ":$PATH:" in *":$dir:"*) ;; *) echo "$dir" >> "$GITHUB_PATH" ;; esac
+            break
+          done
+          if ! command -v cargo >/dev/null 2>&1; then
+            # THE RUSTUP PROXIES ARE MISSING, NOT THE TOOLCHAIN. rustup installs `cargo`, `rustc` and the
+            # rest as copies of rustup.exe in the same directory; when those are deleted, `rustup` still
+            # answers and reports its toolchains while nothing else on PATH exists. Observed on a runner
+            # whose .cargo/bin held rustup.exe and nothing else.
+            #
+            # `rustup self update` reinstalls the proxies, which is the sanctioned repair. If it cannot
+            # (offline, or a rustup installed by a package manager), the proxies are recreated directly --
+            # copying rustup.exe under each name is exactly what rustup does internally.
+            rustup_bin="$(command -v rustup || true)"
+            if [ -z "$rustup_bin" ]; then
+              echo "::error::neither cargo nor rustup is on this runner. Install rustup for the account the runner service runs as."
+              exit 1
+            fi
+            bindir="$(dirname "$rustup_bin")"
+            echo "::warning::cargo is missing from ${bindir}; repairing the rustup proxies"
+            rustup self update || echo "rustup self update did not run; recreating the proxies directly"
+            if ! command -v cargo >/dev/null 2>&1; then
+              ext=""
+              case "$rustup_bin" in *.exe) ext=".exe" ;; esac
+              for tool in cargo rustc rustdoc rustfmt cargo-fmt cargo-clippy clippy-driver; do
+                [ -e "${bindir}/${tool}${ext}" ] || cp "$rustup_bin" "${bindir}/${tool}${ext}"
+              done
+              chmod 0755 "${bindir}"/* 2>/dev/null || true
+              hash -r 2>/dev/null || true
+            fi
+          fi
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error::cargo still does not resolve after repair. rustup=$(command -v rustup || echo none). Reinstall rustup for the account the runner service runs as."
+            exit 1
+          fi
+          echo "cargo: $(command -v cargo)"
+          # From inside native/, so the versions printed are the ones rust-toolchain.toml pins. `rustc`
+          # is reported and not required: the rustup cargo shim resolves rustc for its own children, so a
+          # missing rustc shim does not stop a build -- it only stops a step that runs rustc directly.
+          ( cd native && cargo --version )
+          ( cd native && rustc --version ) || echo "rustc does not resolve directly; cargo will resolve it"
+
+
+      - name: Build both descriptor profiles
+        shell: bash
+        run: tools/build-native.sh build ${{ matrix.platform }} staged
+
+      # Separate directory, separate artifact: these must not reach the zip or the descriptor.
+      - name: Build the symbolized profiling library
+        shell: bash
+        run: tools/build-native.sh build ${{ matrix.platform }} staged-profiling profiling
+
+      # macOS debug information is a .dSYM BUNDLE -- a directory. A release asset is a single file, so it
+      # is tarred here rather than at publish time, on the machine that produced it.
+      - name: Pack the macOS debug bundle
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd staged-profiling
+          for d in *.dSYM; do
+            [ -d "$d" ] || continue
+            tar -czf "$d.tar.gz" "$d"
+            rm -rf "$d"
+          done
+          ls -l
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbitnav-${{ matrix.platform }}
+          path: staged/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orbitnav-profiling-${{ matrix.platform }}
+          path: staged-profiling/
+
+  publish:
+    needs: build
+    runs-on: [self-hosted, Linux, X64, legion]
+    permissions:
+      contents: write        # create the release, and push the manifest branch
+      pull-requests: write   # main is protected, so the manifest arrives as a PR
+    steps:
+      # THE TAG, not main. This job assembles the zip from the working tree, and the binaries it downloads
+      # were built from the tag's sources -- so checking out main shipped a zip pairing the tag's backend
+      # with whatever GDScript main had drifted to. The manifest commit below re-targets main explicitly
+      # rather than relying on this checkout.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: orbitnav-*
+          path: incoming
+          merge-multiple: false
+
+      # bin/ is gitignored and empty in a fresh checkout, so this is what fills it.
+      - name: Install the binaries
+        run: |
+          set -euo pipefail
+          mkdir -p addons/orbitnav_native/bin profiling
+          for p in linux windows macos; do
+            cp incoming/orbitnav-$p/*            addons/orbitnav_native/bin/
+            cp incoming/orbitnav-profiling-$p/*  profiling/
+          done
+          ls -l addons/orbitnav_native/bin profiling
+          # A truncated download or an empty file here would publish a release that cannot load.
+          for f in addons/orbitnav_native/bin/* profiling/*; do
+            test -s "$f" || { echo "::error::$f is empty"; exit 1; }
+          done
+
+      # The bytes about to be published must be exactly the ones the descriptor names. A missing platform
+      # or a renamed profile passes every Linux gate and fails at dlopen on a user's machine.
+      - name: The published set is the set the descriptor names
+        run: |
+          set -euo pipefail
+          named="$(grep -oE 'res://addons/orbitnav_native/bin/[^"]+' \
+            addons/orbitnav_native/orbitnav.gdextension | sed 's|.*/||' | sort -u)"
+          have="$(ls addons/orbitnav_native/bin | sort -u)"
+          if ! diff <(printf '%s\n' "$named") <(printf '%s\n' "$have"); then
+            echo "::error::the built set and the descriptor's set differ (< descriptor, > built)"
+            exit 1
+          fi
+          echo "publishing exactly the $(printf '%s\n' "$named" | grep -c .) libraries the descriptor names"
+
+      # INPUT_VERSION THROUGH THE ENVIRONMENT, NOT `${{ }}` INTERPOLATION. Expression interpolation
+      # splices the value into the script SOURCE before bash parses it, so a crafted dispatch input
+      # would run as code on a persistent self-hosted runner. Read as an env var it is data.
+      - name: Stamp the plugin version from the tag
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
+            version="${INPUT_VERSION#v}"
+          fi
+          case "$version" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::refusing version '$version'"; exit 1 ;;
+          esac
+          sed -i "s/^version=\".*\"$/version=\"${version}\"/" addons/orbitnav/plugin.cfg
+          grep '^version=' addons/orbitnav/plugin.cfg
+
+      # tools/make-assetlib-zip.py RATHER THAN THE `zip` BINARY. The publish runner has neither `zip`
+      # nor `unzip`: a dry run failed here with "zip: command not found" after all three cross-platform
+      # builds had already succeeded. The script uses python3's standard library, needs no package
+      # install, and counts the libraries it packaged rather than trusting the walk -- bin/ is
+      # gitignored, so a clean checkout would otherwise ship an addon with no backend and say nothing.
+      - name: Build the Asset Library zip
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ] || [ "$version" = "$GITHUB_REF_NAME" ]; then
+            version="${INPUT_VERSION#v}"
+          fi
+          # The licences ride INSIDE the payload: an addon installed from a zip carries no repository
+          # with it, and a user who cannot find the terms will assume the worst.
+          cp LICENSE LICENSE-MIT LICENSE-APACHE THIRD_PARTY.md addons/orbitnav/
+          tools/make-assetlib-zip.py "$version"
+          rm -f addons/orbitnav/LICENSE addons/orbitnav/LICENSE-MIT \
+                addons/orbitnav/LICENSE-APACHE addons/orbitnav/THIRD_PARTY.md
+
+      # EVERY published asset, including the AssetLib zip. A consumer that pins this tag can fetch the
+      # single zip -- which carries both addon directories and all six libraries -- and verify one digest,
+      # rather than fetching six files and trusting the set was complete. Written after the zip is built,
+      # so a tag commit cannot contain its own digest; main gets it one commit later. Harmless, because CI
+      # builds rather than fetches.
+      - name: Write the asset manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          {
+            printf '{\n  "tag": "%s",\n  "assets": {\n' "$tag"
+            first=1
+            for f in build/orbitnav-*.zip addons/orbitnav_native/bin/* profiling/*; do
+              name="$(basename "$f")"
+              [ "$first" -eq 1 ] || printf ',\n'
+              first=0
+              printf '    "%s": { "size": %s, "sha256": "%s" }' \
+                "$name" "$(stat -c%s "$f")" "$(sha256sum "$f" | cut -d' ' -f1)"
+            done
+            printf '\n  }\n}\n'
+          } > addons/orbitnav_native/binaries.json
+          cat addons/orbitnav_native/binaries.json
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            build/orbitnav-*.zip
+            addons/orbitnav_native/bin/*
+            addons/orbitnav_native/binaries.json
+            profiling/*
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **Asset Library:** download `orbitnav-*.zip` below and use *AssetLib → Install from file*, then
+            enable **OrbitNav** in *Project → Project Settings → Plugins*.
+
+            **Manual:** copy `addons/orbitnav/` and `addons/orbitnav_native/` from the zip into your project.
+            Both directories are required — `Net` without the extension is a facade over nothing.
+
+            The binaries in the zip are plain files, not Git LFS pointers: they work straight out of it.
+
+            ## Pinning this release from a build
+
+            `binaries.json` carries the size and sha256 of every asset on this release and is committed
+            to `main`, so a fetch is verified against the commit graph rather than against a checksum
+            published beside the file it describes.
+
+            Fetch the **zip** to get both addon directories and all six libraries against one digest. The
+            loose binaries are also attached individually, for a project that wants only the files its
+            own `.gdextension` names.
+
+            | Asset | What it is |
+            | --- | --- |
+            | `*.template_debug.*` | Loaded when a project runs from source. Carries `debug-assertions` and `overflow-checks`. |
+            | `*.template_release.*` | Loaded by an exported game. |
+            | `*.profiling.*` | Release build with debug information retained, for a native profiler. Not named by the descriptor. |
+
+            OrbitNav is 0.x. The `Net` facade is the stable surface; everything behind it may change.
+
+      # AFTER the release exists, and as a PULL REQUEST. `main` is protected -- "Changes must be made
+      # through a pull request" -- so a bot push is rejected with GH006 by construction, on every run
+      # whose builds all succeeded. A step that can only pass by having nothing to push is not a guard.
+      #
+      # A SEPARATE WORKTREE, because this checkout is the TAG and it is dirty by now: plugin.cfg has been
+      # stamped and binaries.json freshly written. `git checkout -B` in this tree aborts whenever either
+      # differs between the tag and main.
+      #
+      # AFTER the publish, because the release is the artifact that matters. This step failing must never
+      # cost three cross-platform builds and a tag that cannot be re-run.
+      - name: Propose the manifest to main
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          branch="release-manifest/${GITHUB_REF_NAME}"
+          wt="$RUNNER_TEMP/main-worktree"
+          rm -rf "$wt"
+          git worktree prune
+          git fetch origin main
+          git worktree add --detach "$wt" origin/main
+          # `cp`, not a shell round trip: command substitution strips trailing newlines.
+          cp addons/orbitnav_native/binaries.json "$wt/addons/orbitnav_native/binaries.json"
+          cp addons/orbitnav/plugin.cfg           "$wt/addons/orbitnav/plugin.cfg"
+          git -C "$wt" add addons/orbitnav_native/binaries.json addons/orbitnav/plugin.cfg
+          if git -C "$wt" diff --cached --quiet; then
+            echo "manifest unchanged; nothing to propose"
+            git worktree remove --force "$wt"
+            exit 0
+          fi
+          git -C "$wt" commit -m "release: binaries manifest and plugin version for ${GITHUB_REF_NAME}"
+          git -C "$wt" push --force origin "HEAD:refs/heads/${branch}"
+          git worktree remove --force "$wt"
+          # The API's answer decides this step's exit code. Piping curl into a printer exits 0 whatever
+          # GitHub said, which is how v0.1.1's refusal ("GitHub Actions is not permitted to create or
+          # approve pull requests") was reported as success while the manifest sat on an unmerged branch.
+          # A pull request already open for this branch -- a re-run of the same tag -- is success.
+          tools/propose-manifest-pr.py "${GITHUB_REPOSITORY}" "${branch}" main "${GITHUB_REF_NAME}"

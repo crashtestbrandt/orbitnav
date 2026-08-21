@@ -1,0 +1,69 @@
+; OrbitNav — Rust GDExtension descriptor. THE NAVIGATION BACKEND: the Nav facade
+; (addons/orbitnav/nav.gd) drives the OrbitNav class this library registers, and nav.gd is the only file
+; allowed to name it. Sources live in native/ (a cargo workspace at the repo root, deliberately OUTSIDE
+; the shipped addon).
+;
+; NO BINARY IS COMMITTED TO THIS REPOSITORY. bin/ is gitignored and empty in a fresh clone. Three ways
+; to fill it:
+;   * `just native-install` builds THIS host's library from native/. What a contributor runs, and what
+;     every CI job does before it loads anything.
+;   * A release zip (`orbitnav-<version>.zip`) ships bin/ already populated for all three platforms.
+;     That is the Asset Library payload and what a manual install copies.
+;   * A consumer pins a release tag and downloads its assets, verifying the bytes against
+;     addons/orbitnav_native/binaries.json -- the sha256 of every published asset, including the zip,
+;     committed INSTEAD of the binaries themselves, so a tampered download is caught against something in
+;     the commit graph rather than against a checksum published beside the file it describes.
+;
+; Git LFS is not an option for the shipped artifact either way: the Asset Library installs an addon from
+; a repository TARBALL, and LFS content arrives in a tarball as POINTER FILES -- a few hundred bytes of
+; text -- so dlopen fails with "invalid ELF header" behind a confusing parse cascade, and the user has
+; no way to tell that from a broken build.
+;
+; TWO BUILDS PER PLATFORM, AND THEY ARE NOT THE SAME BYTES. Godot selects the template_debug entry
+; whenever a project runs FROM SOURCE -- every CI gate, every editor run -- and the template_release
+; entry for an exported game.
+;
+; template_debug is cargo's `template-debug` profile. It INHERITS `release`, so it is not the 10-50x
+; slower cargo debug build: opt-level, LTO and strip are unchanged and only the checks differ. It adds
+; `debug-assertions` and `overflow-checks`, which is what makes `debug_assert!` reachable at all. This
+; addon's derive phases are gated on reproducing another implementation BYTE FOR BYTE, and an assertion
+; about an invariant the fast path takes on trust is the cheapest place for a divergence to surface.
+;
+; tools/build-native.sh is the only place that maps a platform and a profile onto a filename, and
+; tools/check-descriptor-parity.sh fails the PR when an entry below names something nothing builds. That
+; gate exists because a bad entry fails at `dlopen` on the affected platform and nowhere else: every
+; Linux gate stays green while a Windows checkout takes the `Nav` autoload down with it.
+;
+; A symbolized `profiling` build is published per platform as a release asset. It is deliberately NOT an
+; entry below -- it is a developer tool, swapped in under a profile-only directory, and shipping it
+; would put debug information nobody loads into every export.
+;
+; compatibility_minimum is 4.4, not the version the harness is developed against: a gdext extension
+; loads in any Godot at or above the API it was built against, so a 4.4 baseline stays usable by public
+; projects on older 4.x releases. Raise it only with a matching bump to the `api-4-4` feature in
+; native/crates/orbitnav-godot/Cargo.toml -- they must agree.
+;
+; reloadable is false deliberately. This extension owns a worker pool and the volumes those workers are
+; reading; hot reload is the least-exercised corner of the toolchain and there is no benefit to trading
+; robustness for it.
+
+[configuration]
+
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = "4.4"
+reloadable = false
+
+[libraries]
+
+linux.debug.x86_64 = "res://addons/orbitnav_native/bin/liborbitnav.linux.template_debug.x86_64.so"
+linux.release.x86_64 = "res://addons/orbitnav_native/bin/liborbitnav.linux.template_release.x86_64.so"
+windows.debug.x86_64 = "res://addons/orbitnav_native/bin/orbitnav.windows.template_debug.x86_64.dll"
+windows.release.x86_64 = "res://addons/orbitnav_native/bin/orbitnav.windows.template_release.x86_64.dll"
+macos.debug = "res://addons/orbitnav_native/bin/liborbitnav.macos.template_debug.universal.dylib"
+macos.release = "res://addons/orbitnav_native/bin/liborbitnav.macos.template_release.universal.dylib"
+
+; No linux arm64 entry: nothing builds it yet. Adding one is a matrix entry in the build workflows, a
+; platform case in tools/build-native.sh and a line here -- the Rust is arch-agnostic.
+; No web entries: Godot's web export cannot load a GDExtension at all.
+; No android/ios entries yet. Nothing here is platform-specific, so mobile is a build-matrix question
+; rather than a navigation one.

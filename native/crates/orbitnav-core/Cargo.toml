@@ -1,0 +1,14 @@
+[package]
+name = "orbitnav-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OrbitNav core — engine-agnostic voxel navigation primitives"
+
+# Deliberately ZERO dependencies, and deliberately NO dependency on `godot`.
+# Everything here is a pure function of plain data, so it runs under `cargo test` in milliseconds
+# and can be reused outside Godot. The worker pool is `std::thread` + `std::sync` for the same
+# reason: a thread-pool crate would be the first dependency and buys nothing at this size.
+[dependencies]

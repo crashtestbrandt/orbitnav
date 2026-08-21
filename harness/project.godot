@@ -1,0 +1,47 @@
+; The OrbitNav HARNESS project.
+;
+; A minimal Godot project whose only job is to exercise the ADDON on its own terms: the addon's own unit
+; suites, and a load smoke that proves the plugin registers `Nav` and the extension registers its class in a
+; project that contains nothing else. It is deliberately NOT a demo -- no game, no scene worth looking at.
+;
+; It exists because a demo is a bad regression gate for a library. A failure in a demo could be the demo's
+; fault or the addon's, and you cannot tell without reading both. If a suite here fails, it is the addon.
+;
+; The addon is mirror-copied in by tools/sync-addons.sh; addons/ and tests/support/ are gitignored build
+; artifacts of that copy.
+
+config_version=5
+
+[application]
+
+config/name="OrbitNav Harness"
+config/description="Unit suites and a load smoke for the OrbitNav addon itself."
+run/main_scene="res://scenes/smoke.tscn"
+config/features=PackedStringArray("4.4", "GL Compatibility")
+
+[autoload]
+
+Nav="*res://addons/orbitnav/nav.gd"
+
+[debug]
+
+gdscript/warnings/untyped_declaration=2
+gdscript/warnings/unsafe_method_access=2
+gdscript/warnings/unsafe_cast=2
+gdscript/warnings/unsafe_call_argument=2
+gdscript/warnings/exclude_addons=true
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/orbitnav/plugin.cfg")
+
+[orbitnav]
+
+; 0 asks the addon to size its pool from the machine: one fewer than the cores it reports, capped at four.
+; A consumer that also renders and simulates should leave it there rather than taking every core.
+worker_threads=0
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"

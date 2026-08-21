@@ -1,0 +1,39 @@
+# --- synced addon copies (build artifacts of tools/sync-addons.sh) ---------------------------------
+# The CANONICAL addon lives at the repo root. Every Godot project here gets a mirror-copy, which must
+# never be committed and must never be edited -- `just addon-drift` fails if a copy diverges.
+harness/addons/
+harness/tests/support/
+
+# --- Godot ----------------------------------------------------------------------------------------
+.godot/
+*.translation
+# Godot writes these next to a project when exporting or importing; none of it is source.
+export_presets.cfg.bak
+
+# --- Rust -----------------------------------------------------------------------------------------
+native/target/
+**/*.rs.bk
+
+# --- the compiled extension ------------------------------------------------------------------------
+# NO BINARY IS COMMITTED TO THIS REPOSITORY. `just native-install` builds this host's copy here, CI
+# builds its own, and a release publishes all three platforms as assets plus a sha256 manifest
+# (addons/orbitnav_native/binaries.json) that IS committed. See the .gdextension header.
+addons/orbitnav_native/bin/
+
+# --- build outputs ---------------------------------------------------------------------------------
+build/
+dist/
+
+# --- local tooling ---------------------------------------------------------------------------------
+.godot-nix/
+.direnv/
+result
+result-*
+# Machine-specific MCP / editor configuration.
+.mcp.json
+.vscode/
+.idea/
+
+# --- OS --------------------------------------------------------------------------------------------
+.DS_Store
+Thumbs.db

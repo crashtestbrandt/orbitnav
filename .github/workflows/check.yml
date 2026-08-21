@@ -1,0 +1,172 @@
+name: check
+
+# The PR gate. Deliberately small and deliberately in this order: the two gates that need no Godot at all
+# run first (a grep and a cargo run), so the common failures report in seconds rather than after a Godot
+# download.
+#
+# GITHUB-HOSTED RUNNERS, NOT SELF-HOSTED. A public repository must never point fork-PR CI at a self-hosted
+# runner: a fork PR can change the workflow, and a self-hosted runner executes it on your machine with your
+# filesystem. The cost is installing Godot per job, which the cache below makes cheap.
+#
+# `pull_request`, NOT `pull_request_target`, for the same family of reasons: fork PRs get no secrets and no
+# write token, which is exactly right for a gate that only needs to read the diff.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GODOT_VERSION: 4.4.1-stable
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No Godot needed for either of these.
+      # Called directly rather than through `just`: the recipes are one line each and a hosted runner has
+      # no `just` installed, so adding one would be a dependency bought for nothing.
+      #
+      # --check-tracked, NOT --check. The synced copies are gitignored, so a fresh checkout has none, and
+      # --check would correctly report every one of them "missing" -- it is a LOCAL gate against editing a
+      # copy instead of the canonical source, and it needs the copies to exist. What can actually go wrong
+      # in a COMMIT is that a copy was committed, creating a second source of truth; that is this gate.
+      - name: No synced addon copy is committed
+        run: tools/sync-addons.sh --check-tracked
+
+      - name: Facade boundary (nav-check)
+        run: tools/nav-check.sh
+
+      # A descriptor entry naming a library nothing builds fails at dlopen on that platform and nowhere
+      # else, so every Linux gate stays green while a Windows checkout is broken. This compares the two
+      # lists instead of testing for files CI cannot see.
+      - name: Descriptor / build-matrix parity
+        run: tools/check-descriptor-parity.sh
+
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+      - name: fmt
+        run: cd native && cargo fmt --all --check
+      - name: clippy
+        run: cd native && cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cd native && cargo test --workspace
+
+  godot:
+    runs-on: ubuntu-latest
+    needs: [gates, native]
+    steps:
+      - uses: actions/checkout@v4
+
+      # This job builds the cdylib it loads, so it needs the toolchain. Its cache is its OWN, not the
+      # `native` job's: rust-cache keys on the job id unless `shared-key` is set, and `key` only adds a
+      # further discriminator. Sharing would not help anyway -- `native` compiles the dev profile for
+      # clippy and tests, this job compiles `template-debug` and `release`, which are different target
+      # directories with no artifact overlap.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+          key: godot-gate
+
+      - name: Cache the Godot binary
+        id: godot-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/godot
+          key: godot-${{ env.GODOT_VERSION }}
+
+      - name: Install Godot
+        if: steps.godot-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/godot
+          base="https://github.com/godotengine/godot-builds/releases/download/${GODOT_VERSION}"
+          curl -fsSL -o /tmp/godot.zip "${base}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          unzip -q -o /tmp/godot.zip -d ~/godot
+          mv ~/godot/Godot_v${GODOT_VERSION}_linux.x86_64 ~/godot/godot
+          chmod +x ~/godot/godot
+
+      - name: Put Godot on PATH
+        run: echo "$HOME/godot" >> "$GITHUB_PATH"
+
+      # The addon must be mirrored into each project before anything can load. Doing it here rather than
+      # committing the copies is what keeps one canonical source in the tree.
+
+      # THE GATE BUILDS THE LIBRARY IT LOADS. It used to load whatever binary happened to be committed,
+      # which is how a stale one went unnoticed for three `native/**` commits: the Rust changed, the blob did
+      # not, and every run was green against the old code. Building here means the GDScript under test and
+      # the backend under test come from the same commit, always.
+      #
+      # BOTH descriptor profiles. Every step below runs a project from source, so Godot loads the
+      # `template_debug` entry -- and that profile is the only one carrying `debug-assertions` and
+      # `overflow-checks`, without which the workspace's `debug_assert!`s are compiled out of every
+      # binary the gate has ever loaded. `template_release` is built here too because nothing else in a
+      # PR compiles it: `cargo test` and `clippy --all-targets` both use the dev profile, so an LTO or
+      # codegen failure in the shipping profile would surface at tag time. binaries.yml proves the other
+      # two platforms; this job is Linux-only and cannot speak for them.
+      - name: Build this commit's own cdylib
+        run: tools/build-native.sh build linux addons/orbitnav_native/bin
+
+      # After the build, so every project mirrors the freshly built bin/ rather than a stale copy.
+      - name: Sync the addon into every project
+        run: tools/sync-addons.sh
+
+      - name: Confirm the extension binary is real (not a pointer, not empty)
+        run: |
+          set -euo pipefail
+          # Every name this platform's descriptor entries resolve to, asked of the script that owns the
+          # mapping. A `for` over the directory would pass vacuously if the build staged nothing.
+          for name in $(tools/build-native.sh names linux); do
+            lib="addons/orbitnav_native/bin/$name"
+            test -s "$lib" || { echo "::error::$lib is missing or empty"; exit 1; }
+            if head -c 64 "$lib" | grep -q 'git-lfs.github.com'; then
+              echo "::error::$lib is a Git LFS POINTER, not a library. See the .gdextension header."
+              exit 1
+            fi
+            magic="$(head -c 4 "$lib" | od -An -tx1 | tr -d ' \n')"
+            test "$magic" = "7f454c46" || { echo "::error::$lib is not an ELF object (magic=$magic)"; exit 1; }
+            ls -l "$lib"
+          done
+
+      - name: Lint (headless project load, warnings-as-errors)
+        run: tools/lint-gdscript.sh harness
+
+      # The suites the addon is gated on, including derive_parity_test.gd -- which runs the Rust derive
+      # against an INDEPENDENT GDScript transcription of the same specification and demands identical
+      # arrays. It asserts the extension is loaded rather than skipping when it is not, so a job that
+      # failed to build the cdylib fails here instead of reporting green over an addon that does nothing.
+      - name: Unit suites
+        run: godot --headless --path harness --script tests/support/run_unit_tests.gd
+
+      # --skip-build because the build already happened above; the smoke loads what that step installed
+      # rather than compiling a second copy.
+      - name: Extension load smoke (throwaway project)
+        run: tools/orbitnav-smoke.sh --skip-build
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-logs
+          path: |
+            /tmp/orbitnav-lint*
+          if-no-files-found: ignore
+          retention-days: 7
