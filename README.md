@@ -1,4 +1,4 @@
-# OrbitNav
+![OrbitNav](docs/img/banner.png)
 
 Off-thread voxel navigation for Godot 4, in Rust.
 
