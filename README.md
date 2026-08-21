@@ -30,7 +30,7 @@ this addon's.
 
 ## Why it exists
 
-Deriving a station-sized grid and searching it are pure array work over a few hundred thousand cells, and
+Deriving a grid and searching it are pure array work over a few hundred thousand cells, and
 in a scripting language that is seconds per bake and milliseconds per search — on the thread the game is
 trying to render on. Both are also embarrassingly movable: no scene tree, no physics, no engine services.
 
