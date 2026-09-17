@@ -1,0 +1,17 @@
+{
+  "tag": "v0.2.0",
+  "assets": {
+    "orbitnav-0.2.0.zip": { "size": 8030372, "sha256": "09714f080cd9f9c45dca3d09d599b730a46999673b0c793ed477b8b76ee3c51d" },
+    "liborbitnav.linux.template_debug.x86_64.so": { "size": 3687984, "sha256": "3daedb02a8447a424355e529463be6cad9d3185cbde77740d0798244a7276caf" },
+    "liborbitnav.linux.template_release.x86_64.so": { "size": 3445928, "sha256": "256b6f829f2e98df898bfe73335f4c969adf7dee084f49c7b46f4f565e0483d6" },
+    "liborbitnav.macos.template_debug.universal.dylib": { "size": 6729008, "sha256": "1351fc9daa39025eec9f6b8920ca5fcc3fb5180f3bd992929589fbab64460d88" },
+    "liborbitnav.macos.template_release.universal.dylib": { "size": 6315744, "sha256": "93df8f52920d82c04be9a9a04083e5c239711db7988242ec71d37c5db9a78af1" },
+    "orbitnav.windows.template_debug.x86_64.dll": { "size": 3940352, "sha256": "82ae59d92f761dd1f40d82309b208df06e226a310793da10d9ef8766a7f6795a" },
+    "orbitnav.windows.template_release.x86_64.dll": { "size": 3720192, "sha256": "66114a4f9b728734987e502a9a36a9ee735073e4aaa12defb0c8f708a08430e2" },
+    "liborbitnav.linux.profiling.x86_64.so": { "size": 12172032, "sha256": "90de3e5c9a2d15e492c6a1bd77765360054e8478b2e24dbde8f0907a04878465" },
+    "liborbitnav.macos.profiling.arm64.dylib": { "size": 3156016, "sha256": "17cb0f09251be975686f907b998ce58bd23671d60c79b529a2322c17260c0ab1" },
+    "liborbitnav.macos.profiling.arm64.dylib.dSYM.tar.gz": { "size": 3253674, "sha256": "e8c0950c328a8fc2e5f434611116b999ff81cf6dbf260e3443065cdce3fefade" },
+    "orbitnav.pdb": { "size": 7614464, "sha256": "4ff4d35dc9dbe708cbc385bf0ae3cb3a88cda34230391befe3117eb3a4dac830" },
+    "orbitnav.windows.profiling.x86_64.dll": { "size": 3718656, "sha256": "84ed3f7d8e8829ea6a1ee7c05fe2f2e3bdcc1e1738972c3af1f9564379486cb1" }
+  }
+}
