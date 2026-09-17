@@ -50,6 +50,7 @@ pub mod smooth;
 pub mod snap;
 pub mod surface;
 pub mod volume;
+pub mod voxelize;
 
 pub use astar::{Outcome, Search, SearchParams};
 pub use grid::Grid;
@@ -60,3 +61,4 @@ pub use real::Vec3;
 pub use snap::SURFACE_SNAP_R;
 pub use surface::SurfaceArrays;
 pub use volume::Volume;
+pub use voxelize::{voxelize, Geometry};

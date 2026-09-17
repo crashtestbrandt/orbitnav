@@ -17,6 +17,7 @@ The split is what keeps a gdext upgrade from touching logic, and what lets the a
 | `real` | the float widths, made explicit: `Vec3` is `f32`, and `w()` / `n()` name every conversion |
 | `grid` | addressing, bounds, and the world/cell mapping |
 | `occupancy` | which cells hold solid material, plus the solid bounding box |
+| `voxelize` | occupancy from triangles and convex shapes: the cells a cell-sized box query would touch |
 | `surface` | which free cells touch solid, and how enclosed each one is |
 | `components` | which free cells reach each other, labelled twice |
 | `los` | whether a straight segment crosses only usable cells |
@@ -24,7 +25,7 @@ The split is what keeps a gdext upgrade from touching logic, and what lets the a
 | `astar` | the search, and the outcome of asking for a route |
 | `smooth` | collapsing a cell-by-cell route into waypoints |
 | `volume` | the finished product: occupancy plus the five derived arrays |
-| `jobs` | the worker pool |
+| `jobs` | the worker pool: voxelize, derive and search |
 | `navd` | the dump format, for differential testing |
 
 ## What crosses the boundary
@@ -33,6 +34,10 @@ Whole arrays, once per operation. A crossing costs about 0.185 µs — nothing p
 cell: a per-cell API over a two-million-cell volume would spend more time crossing than working. So a bake
 is about ten crossings and a search about five, and `convert.rs` offers no per-element entry point to reach
 for.
+
+Staging geometry is one crossing per SHAPE, and each crossing only copies: a mesh's faces are copied into
+the staging as they are, and mapping them to world space, welding and culling all happen inside the voxelize
+job. A caller staging on a thread it cares about pays for the copies and nothing else.
 
 Reading the five derived arrays back into the caller costs a copy and buys a consumer that can keep every
 existing reader of those arrays unchanged.

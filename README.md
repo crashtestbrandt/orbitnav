@@ -8,8 +8,9 @@ to a point, and an A\* route between two points. A worker pool runs all of it of
 
 ```gdscript
 var vol: NavVolumeHandle = Nav.make_volume(origin, 1.0, dims)
-vol.upload_occupancy(solid)              # one byte per cell; you decide what is solid
-var bake: NavPathJob = vol.derive()      # on a worker; the caller does not wait
+vol.begin_geometry()                     # hand over collision shapes...
+vol.add_shape(shape, body_xform * shape_xform)
+var bake: NavPathJob = vol.voxelize()    # ...and a worker decides which cells are solid, then derives
 # ... once bake.is_settled() ...
 vol.apply_derive(bake)
 
@@ -24,9 +25,16 @@ var path: PackedVector3Array = job.take()
 for navigation rather than for AI deliberately: an addon named for AI attracts decision code, which is the
 half that should stay in the game.
 
-**It does not look at your world.** Deciding whether a cell holds solid material means asking a physics
-engine about your geometry, and that is yours. You hand over one byte per cell; everything after that is
-this addon's.
+**It does not look at your world.** Which bodies count as geometry is yours to decide. You either hand over
+the collision shapes of the bodies you choose, or one byte per cell you filled yourself; everything after
+that is this addon's.
+
+**Voxelizing reproduces a box query.** A cell is solid when a box the size of the cell touches a shape, with
+the two rules a Jolt Physics `intersect_shape` applies: the query box and convex shapes are rounded by their
+collision margin, and a `ConcavePolygonShape3D` only reports cells in front of its faces unless
+`backface_collision` is set. Measured against a per-cell Jolt query over 16 volumes (hulls, excavated rock,
+box-slab scaffolds; 154 000 solid cells), it missed no solid cell. Every cell it added is an exact face contact,
+which Jolt's `f32` rounding reports on some plates and not on others.
 
 ## Why it exists
 

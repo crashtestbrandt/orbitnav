@@ -1,4 +1,4 @@
-//! The worker pool: derive and search off the caller's thread.
+//! The worker pool: voxelize, derive and search off the caller's thread.
 //!
 //! The caller is a game's main thread, and everything here exists so it never waits. [`Pool::submit`]
 //! hands work over and returns immediately; [`Pool::poll`] is a lock-and-read; [`Pool::take`] moves a
@@ -26,8 +26,10 @@
 //! deliberately not set for the same reason.
 
 use crate::astar::{Outcome, Search, SearchParams};
+use crate::grid::Grid;
 use crate::real::Vec3;
 use crate::volume::Volume;
+use crate::voxelize::{voxelize, Geometry, Region};
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -53,8 +55,10 @@ pub enum JobOutput {
     Derived {
         /// The finished volume.
         volume: Arc<Volume>,
-        /// Microseconds of worker time.
+        /// Microseconds of worker time spent deriving.
         usec: u64,
+        /// Microseconds of worker time spent voxelizing first. Zero for a plain derive.
+        voxelize_usec: u64,
     },
     /// A finished search.
     Path {
@@ -94,9 +98,25 @@ enum Slot {
     Cancelled,
 }
 
+/// What a voxelize job fills its grid from. See [`crate::voxelize`].
+#[derive(Debug, Default)]
+pub struct Voxelization {
+    /// The triangles and convex pieces.
+    pub geometry: Geometry,
+    /// Spheres bounding where geometry may be. Empty places no restriction.
+    pub regions: Vec<Region>,
+    /// The radius the cell box's edges and corners are rounded by.
+    pub cell_rounding: f64,
+}
+
 enum Work {
     Derive {
         volume: Arc<Volume>,
+        workers: usize,
+    },
+    Voxelize {
+        grid: Grid,
+        input: Voxelization,
         workers: usize,
     },
     Search {
@@ -173,6 +193,20 @@ impl Pool {
     pub fn submit_derive(&self, volume: Arc<Volume>, stamp: VolumeStamp) -> JobId {
         let workers = self.derive_workers;
         self.enqueue(stamp, Work::Derive { volume, workers })
+    }
+
+    /// Queue a voxelize of `grid` from `input`, followed by a derive of the result. It finishes as a
+    /// [`JobOutput::Derived`], exactly as [`Pool::submit_derive`] does.
+    pub fn submit_voxelize(&self, grid: Grid, input: Voxelization, stamp: VolumeStamp) -> JobId {
+        let workers = self.derive_workers;
+        self.enqueue(
+            stamp,
+            Work::Voxelize {
+                grid,
+                input,
+                workers,
+            },
+        )
     }
 
     /// Queue a search over `volume`.
@@ -332,6 +366,21 @@ fn worker_loop(shared: Arc<Shared>) {
                 JobOutput::Derived {
                     volume: Arc::new(derived),
                     usec: started.elapsed().as_micros() as u64,
+                    voxelize_usec: 0,
+                }
+            }
+            Work::Voxelize {
+                grid,
+                input,
+                workers,
+            } => {
+                let occ = voxelize(&grid, &input.geometry, &input.regions, input.cell_rounding);
+                let voxelized = started.elapsed();
+                let derived = Volume::derive(&occ, workers);
+                JobOutput::Derived {
+                    volume: Arc::new(derived),
+                    usec: (started.elapsed() - voxelized).as_micros() as u64,
+                    voxelize_usec: voxelized.as_micros() as u64,
                 }
             }
             Work::Search { volume, params } => {
@@ -401,6 +450,37 @@ mod tests {
         match pool.take(job) {
             Some(JobOutput::Derived { volume, .. }) => {
                 assert_eq!(volume.surface_flag, v.surface_flag);
+            }
+            other => panic!("expected a derive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_voxelize_comes_back_derived() {
+        use crate::voxelize::{Affine, Sides};
+        let pool = Pool::new(2);
+        let grid = Grid::new(Vec3::ZERO, 1.0, [10, 10, 6]);
+        let mut input = Voxelization::default();
+        let floor = vec![
+            Vec3::new(0.0, 0.0, 0.5),
+            Vec3::new(10.0, 0.0, 0.5),
+            Vec3::new(10.0, 10.0, 0.5),
+            Vec3::new(0.0, 0.0, 0.5),
+            Vec3::new(10.0, 10.0, 0.5),
+            Vec3::new(0.0, 10.0, 0.5),
+        ];
+        input
+            .geometry
+            .add_mesh(floor, Affine::IDENTITY, Sides::Both);
+        let job = pool.submit_voxelize(grid, input, stamp());
+        assert_eq!(settle(&pool, job), JobState::Ready);
+        match pool.take(job) {
+            Some(JobOutput::Derived { volume, .. }) => {
+                // The floor sits inside the bottom layer, the same occupancy `small()` writes by hand.
+                let expected = small();
+                assert_eq!(volume.solid, expected.solid);
+                assert_eq!(volume.surface_flag, expected.surface_flag);
+                assert_eq!(volume.comp_surf, expected.comp_surf);
             }
             other => panic!("expected a derive, got {other:?}"),
         }
