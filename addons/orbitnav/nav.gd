@@ -8,11 +8,13 @@ extends Node
 ##
 ## ## What the layer does
 ##
-## A [NavVolumeHandle] is a uniform grid of cubic cells over some region of the world. The consumer decides
-## which cells hold solid material -- that means asking a physics engine, which is the one part of the bake
-## this addon deliberately does not own -- and uploads the answer as one byte per cell. From that, the
-## backend derives which free cells touch solid, how enclosed each one is, and which cells can reach each
-## other; then it answers snap, line-of-sight and pathfinding queries against it.
+## A [NavVolumeHandle] is a uniform grid of cubic cells over some region of the world. Which cells hold solid
+## material reaches the backend one of two ways: the consumer uploads its own answer as one byte per cell, or
+## hands over the collision shapes and a worker decides, cell by cell, whether a cell-sized box touches one
+## ([method can_voxelize]). Which shapes count -- which bodies, layers and exclusions -- stays the consumer's
+## decision either way. From the occupancy, the backend derives which free cells touch solid, how enclosed
+## each one is, and which cells can reach each other; then it answers snap, line-of-sight and pathfinding
+## queries against it.
 ##
 ## ## Work happens on a worker, and the caller never waits
 ##
@@ -103,6 +105,37 @@ func pool_stats() -> PackedInt64Array:
 	if not _available or not _backend_has(&"pool_stats"):
 		return PackedInt64Array([0, 0, 0, 0])
 	return _nav.call(&"pool_stats")
+
+## Whether the backend can voxelize collision shapes itself ([method NavVolumeHandle.begin_geometry]). A
+## backend older than this script cannot, and a volume then has to be filled through
+## [method NavVolumeHandle.upload_occupancy].
+func can_voxelize() -> bool:
+	return _available and _backend_has(&"voxelize_async")
+
+## The radius a physics shape query rounds a convex shape's edges and corners by, for a shape with `margin`
+## whose smallest half extent is `min_half_extent`.
+##
+## Jolt Physics rounds by the smaller of the margin and the smallest half extent times
+## `physics/jolt_physics_3d/collisions/collision_margin_fraction`. A project whose `physics/3d/physics_engine`
+## names any other engine is taken to query with sharp shapes, and gets zero.
+func convex_rounding(margin: float, min_half_extent: float) -> float:
+	if not _physics_is_jolt():
+		return 0.0
+	var fraction: float = ProjectSettings.get_setting(_JOLT_MARGIN_FRACTION, _JOLT_MARGIN_FRACTION_DEFAULT)
+	return maxf(minf(margin, min_half_extent * fraction), 0.0)
+
+## The `cell_rounding` for [method NavVolumeHandle.begin_geometry] that matches a [BoxShape3D] query of half
+## extent `half`, at the box shape's default margin.
+func box_query_rounding(half: float) -> float:
+	return convex_rounding(_BOX_DEFAULT_MARGIN, half)
+
+const _JOLT_MARGIN_FRACTION: String = "physics/jolt_physics_3d/collisions/collision_margin_fraction"
+const _JOLT_MARGIN_FRACTION_DEFAULT: float = 0.08
+const _BOX_DEFAULT_MARGIN: float = 0.04
+
+func _physics_is_jolt() -> bool:
+	var engine: String = ProjectSettings.get_setting("physics/3d/physics_engine", "")
+	return engine == "Jolt Physics"
 
 ## A grid of `dims` cells of `cell_size` metres from world-space min corner `origin`.
 ##

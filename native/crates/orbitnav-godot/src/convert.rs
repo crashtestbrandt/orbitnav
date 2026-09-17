@@ -5,6 +5,7 @@
 
 use godot::prelude::*;
 use orbitnav_core::real::Vec3 as CoreVec3;
+use orbitnav_core::voxelize::Affine;
 
 /// An engine vector as core's own.
 #[inline]
@@ -67,4 +68,18 @@ pub fn points_out(v: &[CoreVec3]) -> PackedVector3Array {
 #[must_use]
 pub fn points_in(a: &PackedVector3Array) -> Vec<CoreVec3> {
     a.as_slice().iter().map(|v| v3_in(*v)).collect()
+}
+
+/// An engine transform as core's affine map, widened to `f64`.
+#[must_use]
+pub fn affine_in(t: Transform3D) -> Affine {
+    let row = |v: Vector3| [f64::from(v.x), f64::from(v.y), f64::from(v.z)];
+    Affine {
+        rows: [
+            row(t.basis.rows[0]),
+            row(t.basis.rows[1]),
+            row(t.basis.rows[2]),
+        ],
+        origin: row(t.origin),
+    }
 }

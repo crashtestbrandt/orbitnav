@@ -18,6 +18,24 @@ extends RefCounted
 ##
 ## Until the derive is applied the volume is not built, and every query answers its inert value.
 ##
+## ## Handing over geometry instead of occupancy
+##
+## A backend that [method Nav.can_voxelize] takes the collision geometry itself and decides on a worker which
+## cells are solid, so the caller does no per-cell work at all:
+##
+## [codeblock]
+## var vol: NavVolumeHandle = Nav.make_volume(origin, 1.0, dims)
+## vol.begin_geometry(PackedVector4Array(), Nav.box_query_rounding(0.5))
+## for each collision shape in the box:
+##     vol.add_shape(shape, body_transform * shape_transform)
+## var job: NavPathJob = vol.voxelize()   # voxelize, then derive, on a worker
+## # ... later, once job.is_settled() ...
+## vol.apply_derive(job)
+## [endblock]
+##
+## A cell is solid when a box the size of the cell, centred on it, touches a shape: the answer a physics
+## engine's box-overlap query gives. See [method begin_geometry] for the options that make it match one.
+##
 ## ## An INERT handle is not an error
 ##
 ## With no backend loaded, [method Nav.make_volume] still hands one of these back. [method is_active] reads
@@ -26,6 +44,8 @@ extends RefCounted
 
 var _nav: Object = null
 var _id: int = 0
+## Whether [method begin_geometry] has opened staging that [method voxelize] has not yet taken.
+var _staging: bool = false
 
 func _init(backend: Object, id: int) -> void:
 	_nav = backend
@@ -85,6 +105,83 @@ func derive_usec() -> int:
 	if not is_active():
 		return 0
 	return _nav.call(&"derive_usec", _id)
+
+# --- voxelize -------------------------------------------------------------------------------------------
+# Staging copies each shape's data and nothing else; mapping, culling and the per-cell tests all run on the
+# worker [method voxelize] hands them to.
+
+## Start staging geometry, dropping anything staged before. False when the volume is inert or the backend
+## cannot voxelize.
+##
+## - `regions`: spheres (`xyz` centre, `w` radius) bounding where geometry may be. A cell whose centre is
+##   outside every one stays free whatever it touches. Empty places no restriction.
+## - `cell_rounding`: the radius the cell box's edges and corners are rounded by. A physics engine that keeps
+##   a convex radius on its query shape reports a box rounded this way; [method Nav.box_query_rounding] gives
+##   the radius for one.
+func begin_geometry(regions: PackedVector4Array = PackedVector4Array(), cell_rounding: float = 0.0) -> bool:
+	_staging = false
+	if not is_active() or not Nav.can_voxelize():
+		return false
+	_staging = _nav.call(&"begin_geometry", _id, regions, cell_rounding)
+	return _staging
+
+## Stage one collision shape, placed in world space by `xform` (the body's transform times the shape's own).
+##
+## Understands every shape a physics body carries except [WorldBoundaryShape3D], [HeightMapShape3D] and
+## [SeparationRayShape3D], which answer false and stage nothing. A [ConcavePolygonShape3D] is a surface: a cell
+## is solid only where it touches a triangle, and a one-sided mesh only claims cells in front of a triangle,
+## which is what a physics engine that ignores back faces reports. Every other shape is solid throughout.
+## Convex shapes are rounded as [method Nav.convex_rounding] says the physics engine rounds them.
+func add_shape(shape: Shape3D, xform: Transform3D) -> bool:
+	if not _staging or shape == null:
+		return false
+	if shape is ConcavePolygonShape3D:
+		var concave: ConcavePolygonShape3D = shape
+		return _nav.call(&"add_faces", _id, concave.get_faces(), xform, concave.backface_collision) >= 0
+	if shape is BoxShape3D:
+		var box: BoxShape3D = shape
+		var half: Vector3 = box.size * 0.5
+		var rounding: float = Nav.convex_rounding(box.margin, minf(half.x, minf(half.y, half.z)))
+		return _nav.call(&"add_box", _id, box.size, xform, rounding)
+	if shape is SphereShape3D:
+		var sphere: SphereShape3D = shape
+		return _nav.call(&"add_sphere", _id, sphere.radius, xform)
+	if shape is CapsuleShape3D:
+		var capsule: CapsuleShape3D = shape
+		return _nav.call(&"add_capsule", _id, capsule.radius, capsule.height, xform)
+	if shape is CylinderShape3D:
+		var cylinder: CylinderShape3D = shape
+		var cylinder_rounding: float = Nav.convex_rounding(cylinder.margin,
+			minf(cylinder.radius, cylinder.height * 0.5))
+		return _nav.call(&"add_cylinder", _id, cylinder.radius, cylinder.height, xform, cylinder_rounding)
+	if shape is ConvexPolygonShape3D:
+		var convex: ConvexPolygonShape3D = shape
+		return _nav.call(&"add_convex", _id, convex.points, xform)
+	return false
+
+## Stage a triangle mesh in a [ConcavePolygonShape3D]'s own face order: three vertices per triangle, clockwise
+## seen from the front. Returns how many triangles were staged, or -1 when nothing is being staged or `faces`
+## is not whole triangles. [method add_shape] calls this for a concave shape.
+func add_faces(faces: PackedVector3Array, xform: Transform3D, double_sided: bool) -> int:
+	if not _staging:
+		return -1
+	return _nav.call(&"add_faces", _id, faces, xform, double_sided)
+
+## Queue a voxelize of everything staged, followed by the derive, on a worker. Poll the job, then hand it to
+## [method apply_derive]; [method solid] then reads the occupancy it produced. Publishes a new generation, as
+## an occupancy upload does. An inert job when nothing was staged.
+func voxelize() -> NavPathJob:
+	if not is_active() or not _staging:
+		return NavPathJob.new(null, 0, 0)
+	_staging = false
+	var job: int = _nav.call(&"voxelize_async", _id)
+	return NavPathJob.new(_nav, _id, job)
+
+## What the last voxelize cost the worker, in microseconds. Zero after a plain derive.
+func voxelize_usec() -> int:
+	if not is_active() or not Nav.can_voxelize():
+		return 0
+	return _nav.call(&"voxelize_usec", _id)
 
 # --- the derived arrays ---------------------------------------------------------------------------------
 # Read back in bulk, once per bake. Every one of these is a whole array in a single call: the boundary has
@@ -209,3 +306,4 @@ func free_volume() -> void:
 	_nav.call(&"free_volume", _id)
 	_id = 0
 	_nav = null
+	_staging = false

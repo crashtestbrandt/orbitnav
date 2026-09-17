@@ -7,18 +7,20 @@
 //! The node registers no `_process`: polling is the caller's, on the caller's cadence.
 
 use crate::convert::{
-    bytes_in, bytes_out, cell_in, cell_out, ints_out, points_in, points_out, v3_in, v3_out,
+    affine_in, bytes_in, bytes_out, cell_in, cell_out, ints_out, points_in, points_out, v3_in,
+    v3_out,
 };
 use godot::classes::Node;
 use godot::prelude::*;
 use orbitnav_core::astar::{Outcome, SearchParams};
 use orbitnav_core::grid::{Grid, NO_CELL};
-use orbitnav_core::jobs::{JobOutput, JobState, Pool, VolumeStamp};
+use orbitnav_core::jobs::{JobOutput, JobState, Pool, VolumeStamp, Voxelization};
 use orbitnav_core::los::has_los;
 use orbitnav_core::occupancy::Occupancy;
 use orbitnav_core::smooth::smooth_path;
 use orbitnav_core::snap::nearest_free_cell;
 use orbitnav_core::volume::Volume;
+use orbitnav_core::voxelize::{Region, Sides, Winding};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -33,6 +35,10 @@ struct Entry {
     built: bool,
     /// What the last derive cost the worker, in microseconds.
     derive_usec: i64,
+    /// What the last voxelize cost the worker, in microseconds.
+    voxelize_usec: i64,
+    /// Geometry staged since `begin_geometry`, waiting for `voxelize_async`.
+    staged: Option<Voxelization>,
 }
 
 /// Off-thread voxel navigation: occupancy classification, connected components, line of sight and
@@ -90,6 +96,11 @@ impl OrbitNav {
             id: vol as u64,
             generation: e.generation,
         })
+    }
+
+    /// The geometry being staged for `vol`, or `None` when `begin_geometry` has not been called.
+    fn staging(&mut self, vol: i64) -> Option<&mut Voxelization> {
+        self.volumes.get_mut(&vol).and_then(|e| e.staged.as_mut())
     }
 
     /// A built volume, or `None`. Every query answers its own inert value when this is `None`.
@@ -175,6 +186,8 @@ impl OrbitNav {
                 generation: 1,
                 built: false,
                 derive_usec: 0,
+                voxelize_usec: 0,
+                staged: None,
             },
         );
         id
@@ -253,7 +266,12 @@ impl OrbitNav {
         if self.pool().poll(job as u64, Some(stamp)) != JobState::Ready {
             return false;
         }
-        let Some(JobOutput::Derived { volume, usec }) = self.pool().take(job as u64) else {
+        let Some(JobOutput::Derived {
+            volume,
+            usec,
+            voxelize_usec,
+        }) = self.pool().take(job as u64)
+        else {
             return false;
         };
         let Some(entry) = self.volumes.get_mut(&vol) else {
@@ -262,6 +280,7 @@ impl OrbitNav {
         entry.volume = volume;
         entry.built = true;
         entry.derive_usec = usec as i64;
+        entry.voxelize_usec = voxelize_usec as i64;
         true
     }
 
@@ -288,6 +307,177 @@ impl OrbitNav {
     #[func]
     fn derive_usec(&self, vol: i64) -> i64 {
         self.entry(vol).map_or(0, |e| e.derive_usec)
+    }
+
+    // --- voxelize ----------------------------------------------------------------------------
+
+    /// Start staging geometry for [`Self::voxelize_async`], dropping anything staged before.
+    ///
+    /// `regions` are spheres (`xyz` centre, `w` radius) bounding where geometry may be: a cell whose centre
+    /// is outside every one stays free. Empty places no restriction. `cell_rounding` rounds the cell box's
+    /// edges and corners by that radius. False when the volume is unknown.
+    #[func]
+    fn begin_geometry(
+        &mut self,
+        vol: i64,
+        regions: PackedVector4Array,
+        cell_rounding: f64,
+    ) -> bool {
+        let Some(entry) = self.volumes.get_mut(&vol) else {
+            return false;
+        };
+        let regions = regions
+            .as_slice()
+            .iter()
+            .map(|r| Region {
+                centre: orbitnav_core::real::Vec3::new(r.x, r.y, r.z),
+                radius: r.w,
+            })
+            .collect();
+        entry.staged = Some(Voxelization {
+            regions,
+            cell_rounding,
+            ..Voxelization::default()
+        });
+        true
+    }
+
+    /// Stage a triangle mesh, in the order a `ConcavePolygonShape3D` stores its faces: three vertices per
+    /// triangle, clockwise when seen from the front. `transform` places it in world space.
+    ///
+    /// A one-sided mesh claims only cells whose centre is in front of a triangle, which is what a physics
+    /// engine that ignores back faces reports; `double_sided` claims both sides. Returns the triangle
+    /// count staged, or -1 when nothing is being staged or `faces` is not whole triangles.
+    #[func]
+    fn add_faces(
+        &mut self,
+        vol: i64,
+        faces: PackedVector3Array,
+        transform: Transform3D,
+        double_sided: bool,
+    ) -> i64 {
+        let Some(staged) = self.staging(vol) else {
+            return -1;
+        };
+        let slice = faces.as_slice();
+        if !slice.len().is_multiple_of(3) {
+            return -1;
+        }
+        let sides = if double_sided {
+            Sides::Both
+        } else {
+            Sides::Front(Winding::Clockwise)
+        };
+        staged
+            .geometry
+            .add_mesh(points_in(&faces), affine_in(transform), sides);
+        (slice.len() / 3) as i64
+    }
+
+    /// Stage a box of full extents `size`, its edges and corners rounded by `rounding`. False when nothing
+    /// is being staged.
+    #[func]
+    fn add_box(&mut self, vol: i64, size: Vector3, transform: Transform3D, rounding: f64) -> bool {
+        let Some(staged) = self.staging(vol) else {
+            return false;
+        };
+        let half = [
+            f64::from(size.x) * 0.5,
+            f64::from(size.y) * 0.5,
+            f64::from(size.z) * 0.5,
+        ];
+        staged
+            .geometry
+            .add_box(half, rounding, affine_in(transform));
+        true
+    }
+
+    /// Stage a sphere. False when nothing is being staged.
+    #[func]
+    fn add_sphere(&mut self, vol: i64, radius: f64, transform: Transform3D) -> bool {
+        let Some(staged) = self.staging(vol) else {
+            return false;
+        };
+        staged.geometry.add_sphere(radius, affine_in(transform));
+        true
+    }
+
+    /// Stage a capsule along local y. `height` is the full height, caps included, as `CapsuleShape3D`
+    /// states it. False when nothing is being staged.
+    #[func]
+    fn add_capsule(&mut self, vol: i64, radius: f64, height: f64, transform: Transform3D) -> bool {
+        let Some(staged) = self.staging(vol) else {
+            return false;
+        };
+        staged
+            .geometry
+            .add_capsule(radius, height * 0.5 - radius, affine_in(transform));
+        true
+    }
+
+    /// Stage a cylinder along local y of full `height`, its rims rounded by `rounding`. False when nothing
+    /// is being staged.
+    #[func]
+    fn add_cylinder(
+        &mut self,
+        vol: i64,
+        radius: f64,
+        height: f64,
+        transform: Transform3D,
+        rounding: f64,
+    ) -> bool {
+        let Some(staged) = self.staging(vol) else {
+            return false;
+        };
+        staged
+            .geometry
+            .add_cylinder(radius, height * 0.5, rounding, affine_in(transform));
+        true
+    }
+
+    /// Stage the convex hull of `points`. Not rounded. False when nothing is being staged.
+    #[func]
+    fn add_convex(&mut self, vol: i64, points: PackedVector3Array, transform: Transform3D) -> bool {
+        let Some(staged) = self.staging(vol) else {
+            return false;
+        };
+        staged
+            .geometry
+            .add_hull(&points_in(&points), affine_in(transform));
+        true
+    }
+
+    /// Queue a voxelize of the staged geometry, followed by a derive, on a worker. Returns a job handle,
+    /// or 0 when the volume is unknown or nothing was staged.
+    ///
+    /// Takes the staged geometry and publishes a new generation, exactly as an occupancy upload does, so a
+    /// derive already in flight reads stale. Poll the job with [`Self::job_state`] and install it with
+    /// [`Self::apply_derive`]; [`Self::solid`] then reads the occupancy it produced.
+    #[func]
+    fn voxelize_async(&mut self, vol: i64) -> i64 {
+        let Some(entry) = self.volumes.get_mut(&vol) else {
+            return 0;
+        };
+        let Some(input) = entry.staged.take() else {
+            return 0;
+        };
+        let grid = entry.volume.grid;
+        entry.volume = Arc::new(Volume::derive(&Occupancy::empty(grid), 1));
+        entry.generation += 1;
+        entry.built = false;
+        entry.derive_usec = 0;
+        entry.voxelize_usec = 0;
+        let stamp = VolumeStamp {
+            id: vol as u64,
+            generation: entry.generation,
+        };
+        self.pool().submit_voxelize(grid, input, stamp) as i64
+    }
+
+    /// What the last voxelize cost the worker, in microseconds. Zero after a plain derive.
+    #[func]
+    fn voxelize_usec(&self, vol: i64) -> i64 {
+        self.entry(vol).map_or(0, |e| e.voxelize_usec)
     }
 
     // --- bulk read-back ----------------------------------------------------------------------

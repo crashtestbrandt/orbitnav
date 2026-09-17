@@ -1,8 +1,8 @@
 //! The occupancy grid: which cells hold solid material.
 //!
-//! This is the ONE input the derive phases read. Producing it is the caller's job, because deciding
-//! whether a cell intersects geometry means asking a physics engine, and that is the part of the
-//! bake this crate deliberately does not own.
+//! This is the ONE input the derive phases read. It comes from one of two places: the caller fills it
+//! itself, or [`crate::voxelize`] fills it from triangles and convex shapes the caller hands over.
+//! Which bodies count as geometry stays the caller's decision either way.
 //!
 //! A cell nothing wrote is FREE. That is not an accident of initialisation: a caller may sample only
 //! the neighbourhoods where geometry can possibly be, and leave the rest untouched. Everything here
