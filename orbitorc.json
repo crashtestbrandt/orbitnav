@@ -1,0 +1,91 @@
+{
+  "_comment": [
+    "What a remote fleet may launch in this repository. Read by an OrbitOrc agent out of this",
+    "checkout; nothing in this file is code and nothing here is evaluated.",
+    "",
+    "WHAT A FLEET IS FOR HERE. This addon ships a native library per platform, and the thing no single",
+    "machine can check is that the same source produces a working addon on every platform it claims.",
+    "So the modes below are the load smoke and the harness, run on a real box of each kind, rather than",
+    "a session across machines: there is no session to spread.",
+    "",
+    "A GRAPHICAL SESSION MATTERS EVEN HERE. The smoke asserts that a class registers and a property",
+    "round-trips, which a headless run covers. Anything that draws does not, and a box with no session",
+    "would report success having rendered nothing."
+  ],
+
+  "schema": 1,
+  "project": "orbitnav",
+  "engine_project": "harness",
+
+  "checks": {
+    "_comment": [
+      "What a job here needs in order to mean anything, relative to the checkout. These are not where a",
+      "build lands -- they are what must already be present, and the native library is the one whose",
+      "absence ruins a run quietly: every class it registers resolves to nothing, so the project dies at",
+      "load or comes up empty and writes a full metrics file of zeros."
+    ],
+    "requires": [
+      "addons/orbitnav_native/bin",
+      "harness/addons/orbitnav"
+    ]
+  },
+
+  "sync": {
+    "build": ["just", "native-install"],
+    "build_dir": "addons/orbitnav_native/bin",
+    "build_min_bytes": 262144
+  },
+
+  "measurement": {
+    "_comment": [
+      "Nothing here declares evidence columns, because this project's jobs are pass/fail smokes rather",
+      "than measurements. With no declaration the verdict answers `unknown` for every run, which is the",
+      "safe direction: unknown is not a pass, and it is never an accusation."
+    ],
+    "artifact": "metrics.csv",
+    "judged_modes": []
+  },
+
+  "events": {
+    "pattern": "^SMOKE (\\w+) *(.*)$"
+  },
+
+  "modes": {
+    "smoke": {
+      "_comment": [
+        "The load smoke: does a project containing nothing else get a working addon? It prints its own",
+        "markers and exits non-zero on the first failure, so the exit status is the verdict and the log",
+        "says which check went.",
+        "",
+        "No ready marker: this mode finishes on its own rather than coming up and staying up, so there is",
+        "nothing to wait for. It is reported as launched and read from its log."
+      ],
+      "ready": "",
+      "gui": false,
+      "engine": ["--headless"],
+      "argv": ["--quit-after={quit_after}"],
+      "defaults": { "quit_after": 120 }
+    },
+
+    "harness": {
+      "_comment": "The harness project with a window, for judging anything that draws by eye on a real box.",
+      "ready": "SMOKE OK",
+      "gui": true,
+      "argv": ["--quit-after={quit_after}"],
+      "defaults": { "quit_after": 600 }
+    },
+
+    "scene": {
+      "_comment": [
+        "Any scene in the checkout, on a box with a display. The path is positional and lands before the",
+        "separator, where the engine reads it -- the one thing no other mode can name. The agent",
+        "validates the path against its own checkout before launching: it may name a file inside the",
+        "tree and must not become a path out of it."
+      ],
+      "ready": "",
+      "gui": true,
+      "scene": "{scene}",
+      "required": ["scene"]
+    }
+  }
+}
