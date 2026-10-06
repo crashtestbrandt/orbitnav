@@ -179,8 +179,15 @@ SMOKE
 
 # Godot discovers .gdextension files while scanning the project, and a fresh project has no scan
 # cache. Without this pass the library is never loaded and the classes simply do not exist, which
-# presents identically to a genuinely broken build.
-"$GODOT" --headless --path "$WORK" --import >/dev/null 2>&1 || true
+# presents identically to a genuinely broken build. The extension list is written first, so the import
+# loads the library at startup instead of finding it mid-session and crashing at exit
+# (tools/seed-extension-list.sh); a failed import is now a failed smoke.
+"$ROOT/tools/seed-extension-list.sh" "$WORK"
+if ! "$GODOT" --headless --path "$WORK" --import >"$WORK/import.log" 2>&1; then
+	echo "ORBIT-SMOKE FAIL: the import of the throwaway project failed:" >&2
+	tail -40 "$WORK/import.log" >&2
+	exit 1
+fi
 
 LOG="$WORK/smoke.log"
 set +e
